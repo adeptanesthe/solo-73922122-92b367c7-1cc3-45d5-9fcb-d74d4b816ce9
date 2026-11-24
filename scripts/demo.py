@@ -8,11 +8,16 @@ the same container image.  It:
 2. posts numbered frames in a deliberately reordered / duplicated / lossy
    order (with late retransmissions), interleaved with playout pulls,
 3. exercises concurrent pulls after a prefetched burst,
-4. writes the concatenated playout to ``<out>/playout.wav`` and a transcript
+4. optionally (``--suppression`` against a service started with
+   ``MONITOR_AUTO_SUPPRESSION=true``) triggers the notch with three 1000 Hz
+   frames, shows a missing frame keeping it, and releases it with three
+   2000 Hz frames,
+5. writes the concatenated playout to ``<out>/playout.wav`` and a transcript
    to ``<out>/transcript.json``.
 
 Example:
     python3 scripts/demo.py --url http://127.0.0.1:8000 --out demo_out
+    python3 scripts/demo.py --url http://127.0.0.1:8000 --out demo_out --suppression
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ FRAME_SAMPLES = 320
 FRAME_BYTES = FRAME_SAMPLES * 2
 FADE_SAMPLES = 80
 PERIOD = 160  # 100 Hz fundamental -> detected pitch lag of 160 samples
+HOWL_HZ = 1_000.0
+HOWL_BAND_FRAMES = 3  # detection and release both need three frames
 
 
 def _header(headers: dict, name: str) -> str:
@@ -84,15 +91,27 @@ def make_frames(count: int, amplitude: float = 11_000.0) -> list[bytes]:
             + 0.27 * math.sin(2 * math.pi * 2 * n / PERIOD + 0.4)
             + 0.11 * math.sin(2 * math.pi * 3 * n / PERIOD + 1.1)
         )
-        samples.append(int(round(amplitude * envelope * value)))
+        samples.append(round(amplitude * envelope * value))
+    pcm = b"".join(struct.pack("<h", max(-32768, min(32767, s))) for s in samples)
+    return [pcm[i * FRAME_BYTES : (i + 1) * FRAME_BYTES] for i in range(count)]
+
+
+def howl_frames(count: int, freq: float = HOWL_HZ, amplitude: float = 15_000.0) -> list[bytes]:
+    """Phase-continuous sine frames: one strong in-band peak per frame."""
+
+    samples = [
+        round(amplitude * math.sin(2 * math.pi * freq * n / SAMPLE_RATE))
+        for n in range(count * FRAME_SAMPLES)
+    ]
     pcm = b"".join(struct.pack("<h", max(-32768, min(32767, s))) for s in samples)
     return [pcm[i * FRAME_BYTES : (i + 1) * FRAME_BYTES] for i in range(count)]
 
 
 class Demo:
-    def __init__(self, base_url: str, out_dir: Path) -> None:
+    def __init__(self, base_url: str, out_dir: Path, enable_suppression: bool) -> None:
         self.base_url = base_url.rstrip("/")
         self.out_dir = out_dir
+        self.enable_suppression = enable_suppression
         self.frames = make_frames(24)
         self.played: list[bytes] = []
         self.played_kinds: list[str] = []
@@ -100,14 +119,17 @@ class Demo:
         self.transcript: list[dict] = []
 
     def post(self, seq: int) -> str:
+        return self._post_bytes(seq, self.frames[seq])
+
+    def _post_bytes(self, seq: int, payload: bytes) -> str:
         status, body, _ = _request(
-            f"{self.base_url}/frames?seq={seq}", "POST", self.frames[seq]
+            f"{self.base_url}/frames?seq={seq}", "POST", payload
         )
         if status != 202:
             raise SystemExit(f"POST seq={seq} failed with {status}: {body!r}")
-        payload = json.loads(body)
-        self._log("post", seq=seq, detail=payload["status"])
-        return payload["status"]
+        result = json.loads(body)
+        self._log("post", seq=seq, detail=result["status"])
+        return result["status"]
 
     def pull(self, note: str = "") -> bytes:
         status, body, headers = _request(f"{self.base_url}/playout")
@@ -126,6 +148,8 @@ class Demo:
             detail=kind,
             period=_header(headers, "x-period-samples"),
             peak=_header(headers, "x-peak-correlation"),
+            notch=_header(headers, "x-notch-hz"),
+            detector=_header(headers, "x-detector-hz"),
             note=note,
         )
         return body
@@ -139,6 +163,8 @@ class Demo:
                 f"  period={extra['period']}samples"
                 f" peak={float(extra['peak']):.3f}"
             )
+        if extra.get("notch"):
+            line += f"  notch={extra['notch']}Hz (detector {extra['detector']}Hz)"
         if extra.get("note"):
             line += f"  ({extra['note']})"
         print(line)
@@ -191,7 +217,104 @@ class Demo:
             raise SystemExit(f"GET /status failed with {status}")
         stats = json.loads(body)
         self._verify(stats)
+
+        if self.enable_suppression:
+            self._check_suppression_available(stats)
+            self._run_suppression_scenario()
+            status, body, _ = _request(f"{self.base_url}/status")
+            stats = json.loads(body)
+            self._verify_suppression(stats)
+
         self._write_outputs(stats)
+
+    def _check_suppression_available(self, status: dict) -> None:
+        if not status["suppression"]["enabled"]:
+            raise SystemExit(
+                "suppression demo requested but the service has auto suppression "
+                "disabled; start it with MONITOR_AUTO_SUPPRESSION=true"
+            )
+
+    def _run_suppression_scenario(self) -> None:
+        """Trigger, survive a gap, and release the notch over HTTP."""
+
+        _request(f"{self.base_url}/reset", "POST")
+        self.played.clear()
+        self.played_kinds.clear()
+        self.played_seqs.clear()
+
+        print("== auto howling suppression: three 1000 Hz frames trigger ==")
+        seq = 0
+        for frame in howl_frames(HOWL_BAND_FRAMES):
+            self._post_bytes(seq, frame)
+            seq += 1
+        notch = []
+        for index in range(HOWL_BAND_FRAMES):
+            headers = self._pull_headers(f"trigger {index + 1}/3")
+            notch.append(_header(headers, "x-notch-hz"))
+        if notch != ["", "", "1000"]:
+            raise SystemExit(f"expected notch to engage on frame 3, got {notch}")
+
+        print("== missing frame keeps the notch, breaks the count ==")
+        headers = self._pull_headers("seq 3 missing -> concealed, notch holds")
+        if _header(headers, "x-notch-hz") != "1000":
+            raise SystemExit("notch was dropped on a missing frame")
+        seq += 1  # seq 3 was consumed by the concealed pull
+
+        print("== three 2000 Hz frames release the notch ==")
+        release = howl_frames(HOWL_BAND_FRAMES, freq=2_000.0)
+        for frame in release:
+            self._post_bytes(seq, frame)
+            seq += 1
+        released: list[str] = []
+        for _ in range(HOWL_BAND_FRAMES):
+            headers = self._pull_headers("releasing")
+            released.append(_header(headers, "x-notch-hz"))
+        if released != ["1000", "1000", "1000"]:
+            raise SystemExit(f"unexpected release sequence: {released}")
+        headers = self._pull_headers("notch gone after three failing frames")
+        if _header(headers, "x-notch-hz") != "":
+            raise SystemExit("notch was not released after three failing frames")
+
+    def _pull_headers(self, note: str) -> dict:
+        status, body, headers = _request(f"{self.base_url}/playout")
+        if status != 200 or len(body) != FRAME_BYTES:
+            raise SystemExit(f"GET /playout failed with {status}")
+        self.played.append(body)
+        self.played_seqs.append(int(_header(headers, "x-sequence") or -1))
+        self.played_kinds.append(_header(headers, "x-frame-kind"))
+        self._log(
+            "pull",
+            seq=self.played_seqs[-1],
+            detail=self.played_kinds[-1],
+            notch=_header(headers, "x-notch-hz"),
+            detector=_header(headers, "x-detector-hz"),
+            note=note,
+        )
+        return headers
+
+    def _verify_suppression(self, status: dict) -> None:
+        suppression = status["suppression"]
+        problems = []
+        if suppression["engaged_count"] != 1:
+            problems.append(
+                f"expected 1 notch engagement, got {suppression['engaged_count']}"
+            )
+        if suppression["released_count"] != 1:
+            problems.append(
+                f"expected 1 notch release, got {suppression['released_count']}"
+            )
+        if suppression["notch_hz"] is not None:
+            problems.append(f"notch still active: {suppression['notch_hz']}")
+        if suppression["suppressed_frames"] != 2 * HOWL_BAND_FRAMES - 1:
+            problems.append(
+                "unexpected suppressed frame count "
+                f"{suppression['suppressed_frames']}"
+            )
+        if problems:
+            raise SystemExit(
+                "suppression verification failed:\n  " + "\n  ".join(problems)
+            )
+        print("\nsuppression verification: OK")
 
     def _verify(self, status: dict) -> None:
         """Check the observable contract; the demo doubles as a smoke test."""
@@ -250,9 +373,8 @@ class Demo:
         )
 
         counts: dict[str, int] = {}
-        for entry in self.transcript:
-            if entry["action"] == "pull":
-                counts[entry["result"]] = counts.get(entry["result"], 0) + 1
+        for kind in self.played_kinds:
+            counts[kind] = counts.get(kind, 0) + 1
         print("\n== summary ==")
         print(f"pulled frames: {len(self.played)}  by kind: {counts}")
         print(f"engine stats:  {status['stats']}")
@@ -271,8 +393,13 @@ def main() -> int:
         default=os.environ.get("MONITOR_DEMO_OUT", "demo_out"),
         help="directory for playout.wav and transcript.json",
     )
+    parser.add_argument(
+        "--suppression",
+        action="store_true",
+        help="also exercise auto howling suppression (server must have it enabled)",
+    )
     args = parser.parse_args()
-    Demo(args.url, Path(args.out)).run()
+    Demo(args.url, Path(args.out), args.suppression).run()
     return 0
 
 

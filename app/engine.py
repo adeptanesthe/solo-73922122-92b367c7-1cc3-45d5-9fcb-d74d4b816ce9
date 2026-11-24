@@ -28,6 +28,7 @@ from .constants import (
     HISTORY_SAMPLES,
     MAX_PENDING_FRAMES,
 )
+from .suppression import AutoSuppressor, SuppressionInfo
 
 
 class BacklogFullError(RuntimeError):
@@ -53,18 +54,24 @@ class PlayoutResult:
     crossfade_samples: int
     history_samples: int
     next_seq: int
+    suppression: SuppressionInfo
 
 
 class PlayoutEngine:
     """Single-channel, sequence-addressed monitor return."""
 
-    def __init__(self) -> None:
+    def __init__(self, auto_suppression: bool = False) -> None:
         self._state_lock = threading.Lock()
         self._play_lock = threading.Lock()
         self._pending: dict[int, np.ndarray] = {}
         self._next_seq = 0
         self._history = np.zeros(0, dtype=np.int16)
         self._had_gap = False
+        self._suppressor = AutoSuppressor(enabled=auto_suppression)
+        # Diagnostics copy of the suppressor state, refreshed under
+        # ``_state_lock`` so /status never reads filter internals while a pull
+        # is mutating them.
+        self._suppression_state = self._suppressor.snapshot()
         self._stats = {
             "accepted_frames": 0,
             "duplicate_frames": 0,
@@ -73,6 +80,9 @@ class PlayoutEngine:
             "recovered_frames": 0,
             "concealed_frames": 0,
             "silence_frames": 0,
+            "suppressed_frames": 0,
+            "notch_engagements": 0,
+            "notch_releases": 0,
         }
 
     # ------------------------------------------------------------------ input
@@ -143,7 +153,7 @@ class PlayoutEngine:
 
             if frame is None:
                 hidden = self._concealment_for(history)
-                out = hidden.samples
+                unprocessed = hidden.samples
                 if hidden.applied:
                     kind = "concealed"
                 else:
@@ -153,14 +163,21 @@ class PlayoutEngine:
                 # The first real frame after a gap: synthesize what would
                 # have been played for this slot, then blend into the truth.
                 hidden = self._concealment_for(history)
-                out = crossfade_to_true(hidden.samples, frame)
+                unprocessed = crossfade_to_true(hidden.samples, frame)
                 kind = "recovered"
                 fade_samples = FADE_SAMPLES
                 new_had_gap = False
             else:
-                out = frame.copy()
+                unprocessed = frame.copy()
                 kind = "true"
                 new_had_gap = False
+
+            # The suppressor sees the original received frame for detection,
+            # but filters/normalises the audio that actually plays.  Its state
+            # lives under the play lock, so pulls stay strictly sequential and
+            # the filter history carries across frames.
+            source = frame if frame is not None else None
+            out, suppression = self._suppressor.process(unprocessed, source)
 
             with self._state_lock:
                 self._append_history(out)
@@ -173,6 +190,14 @@ class PlayoutEngine:
                     self._stats["concealed_frames"] += 1
                 else:
                     self._stats["silence_frames"] += 1
+                self._stats["suppressed_frames"] = (
+                    self._suppressor.suppressed_frames
+                )
+                self._stats["notch_engagements"] = (
+                    self._suppressor.engaged_count
+                )
+                self._stats["notch_releases"] = self._suppressor.released_count
+                self._suppression_state = self._suppressor.snapshot()
                 history_samples = int(self._history.size)
                 next_seq = self._next_seq
 
@@ -186,6 +211,7 @@ class PlayoutEngine:
                 crossfade_samples=fade_samples,
                 history_samples=history_samples,
                 next_seq=next_seq,
+                suppression=suppression,
             )
 
     # ------------------------------------------------------------------ state
@@ -202,19 +228,21 @@ class PlayoutEngine:
                 "history": self._history.copy(),
                 "had_gap": self._had_gap,
                 "stats": dict(self._stats),
+                "suppression": dict(self._suppression_state),
             }
 
     def reset(self) -> None:
-        """Clear all state.  Waits for an in-flight pull to finish."""
+        """Clear all state, including detector and notch filter state."""
 
-        with self._play_lock:
-            with self._state_lock:
-                self._pending.clear()
-                self._next_seq = 0
-                self._history = np.zeros(0, dtype=np.int16)
-                self._had_gap = False
-                for key in self._stats:
-                    self._stats[key] = 0
+        with self._play_lock, self._state_lock:
+            self._pending.clear()
+            self._next_seq = 0
+            self._history = np.zeros(0, dtype=np.int16)
+            self._had_gap = False
+            self._suppressor.reset()
+            self._suppression_state = self._suppressor.snapshot()
+            for key in self._stats:
+                self._stats[key] = 0
 
     # --------------------------------------------------------------- internal
 

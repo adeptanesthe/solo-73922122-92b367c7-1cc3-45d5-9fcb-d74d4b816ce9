@@ -8,10 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from helpers import tone_frames
 
 from app.constants import FRAME_BYTES, FRAME_SAMPLES
 from app.main import create_app
-from helpers import tone_frames
+from app.suppression import TRIGGER_FRAMES
 
 
 @pytest.fixture()
@@ -193,3 +194,160 @@ def test_status_and_reset(client):
     after = client.get("/status").json()
     assert after["next_seq"] == 0
     assert after["history_samples"] == 0
+
+
+# --------------------------------------------------------- auto suppression
+
+
+@pytest.fixture()
+def suppress_client():
+    with TestClient(create_app(auto_suppression=True)) as test_client:
+        yield test_client
+
+
+def sine_frames(freq: float, count: int, amplitude: float = 15_000.0):
+    samples = np.clip(
+        np.rint(
+            amplitude
+            * np.sin(2 * np.pi * freq * np.arange(FRAME_SAMPLES * count) / 16_000)
+        ),
+        -32768,
+        32767,
+    ).astype(np.int16)
+    return [
+        samples[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES].copy()
+        for i in range(count)
+    ]
+
+
+def test_config_reports_auto_suppression_off_by_default(client):
+    body = client.get("/config").json()
+    suppression = body["auto_suppression"]
+    assert suppression["band_hz"] == [500, 4000]
+    assert suppression["bin_hz"] == 50
+    assert suppression["trigger_frames"] == 3
+    assert suppression["release_frames"] == 3
+    assert suppression["dominance_ratio"] == 0.7
+    assert suppression["simultaneous_notches"] == 1
+    assert client.get("/status").json()["suppression"]["enabled"] is False
+
+
+def test_disabled_api_returns_untouched_audio(client):
+    frames = sine_frames(1000.0, TRIGGER_FRAMES + 1)
+    for seq, frame in enumerate(frames):
+        post_frame(client, seq, frame)
+    for seq, frame in enumerate(frames):
+        response, samples = get_frame(client)
+        np.testing.assert_array_equal(samples, frame)
+        assert response.headers["x-notch-enabled"] == "false"
+        assert response.headers["x-notch-hz"] == ""
+
+
+def test_trigger_over_http_after_three_frames(suppress_client):
+    frames = sine_frames(1000.0, TRIGGER_FRAMES + 2)
+    for seq, frame in enumerate(frames):
+        assert post_frame(suppress_client, seq, frame).json()["status"] == "accepted"
+
+    applied = []
+    for _ in range(len(frames)):
+        response, _ = get_frame(suppress_client)
+        assert response.headers["x-notch-enabled"] == "true"
+        assert int(response.headers["x-detector-hz"]) == 1000
+        applied.append(response.headers["x-notch-hz"])
+    assert applied == ["", "", "1000", "1000", "1000"]
+
+    status = suppress_client.get("/status").json()
+    assert status["suppression"]["notch_hz"] == 1000
+    assert status["suppression"]["engaged_count"] == 1
+    assert status["stats"]["notch_engagements"] == 1
+    assert status["stats"]["suppressed_frames"] == TRIGGER_FRAMES
+
+
+def test_missing_frames_break_count_but_keep_notch_over_http(suppress_client):
+    frames = sine_frames(1000.0, TRIGGER_FRAMES + 1)
+    post_frame(suppress_client, 0, frames[0])
+    post_frame(suppress_client, 1, frames[1])
+    # seq 2 never arrives: a concealed slot in the middle of the streak.
+    assert suppress_client.get("/playout").headers["x-frame-kind"] == "true"
+    assert suppress_client.get("/playout").headers["x-frame-kind"] == "true"
+    concealed = suppress_client.get("/playout")
+    assert concealed.headers["x-frame-kind"] == "concealed"
+    assert concealed.headers["x-notch-hz"] == ""
+    assert suppress_client.get("/status").json()["suppression"][
+        "candidate_frames"
+    ] == 0
+
+    # Resume: the streak restarts at 1, so the third frame from here engages.
+    for index in range(3):
+        seq = 3 + index
+        post_frame(suppress_client, seq, frames[index])
+        response = suppress_client.get("/playout")
+        expected = "1000" if index == 2 else ""
+        assert response.headers["x-notch-hz"] == expected
+
+
+def test_release_over_http_after_three_other_frames(suppress_client):
+    frames = sine_frames(1000.0, TRIGGER_FRAMES)
+    for seq, frame in enumerate(frames):
+        post_frame(suppress_client, seq, frame)
+    for _ in range(TRIGGER_FRAMES):
+        get_frame(suppress_client)
+
+    others = sine_frames(2000.0, 4)
+    for index, frame in enumerate(others):
+        post_frame(suppress_client, TRIGGER_FRAMES + index, frame)
+    applied = []
+    for _ in range(4):
+        response, _ = get_frame(suppress_client)
+        applied.append(response.headers["x-notch-hz"])
+        if response.headers["x-notch-hz"]:
+            assert int(response.headers["x-detector-hz"]) == 2000
+    assert applied == ["1000", "1000", "1000", ""]
+    status = suppress_client.get("/status").json()
+    assert status["suppression"]["notch_hz"] is None
+    assert status["suppression"]["released_count"] == 1
+    assert status["stats"]["notch_releases"] == 1
+
+
+def test_reset_over_http_clears_suppression(suppress_client):
+    frames = sine_frames(1000.0, TRIGGER_FRAMES + 1)
+    for seq, frame in enumerate(frames):
+        post_frame(suppress_client, seq, frame)
+    for _ in range(len(frames)):
+        get_frame(suppress_client)
+    assert suppress_client.get("/status").json()["suppression"]["notch_hz"] == 1000
+
+    suppress_client.post("/reset")
+    state = suppress_client.get("/status").json()["suppression"]
+    assert state["notch_hz"] is None
+    assert state["candidate_frames"] == 0
+    assert state["engaged_count"] == 0
+    assert state["suppressed_frames"] == 0
+
+    # A fresh stream needs the full three-frame streak again.
+    for seq, frame in enumerate(frames[:3]):
+        post_frame(suppress_client, seq, frame)
+    applied = [get_frame(suppress_client)[0].headers["x-notch-hz"] for _ in range(3)]
+    assert applied == ["", "", "1000"]
+
+
+def test_playout_json_reports_suppression(suppress_client):
+    frames = sine_frames(1000.0, TRIGGER_FRAMES)
+    for seq, frame in enumerate(frames):
+        post_frame(suppress_client, seq, frame)
+    for _ in range(TRIGGER_FRAMES - 1):
+        suppress_client.get("/playout?format=json")
+    body = suppress_client.get("/playout?format=json").json()
+    assert body["suppression"]["enabled"] is True
+    assert body["suppression"]["notch_hz"] == 1000
+    assert body["suppression"]["ramp"] == "in"
+    assert body["suppression"]["detector_hz"] == 1000
+
+
+def test_env_flag_enables_suppression(monkeypatch):
+    monkeypatch.setenv("MONITOR_AUTO_SUPPRESSION", "true")
+    with TestClient(create_app()) as test_client:
+        assert test_client.get("/status").json()["suppression"]["enabled"] is True
+    monkeypatch.setenv("MONITOR_AUTO_SUPPRESSION", "off")
+    with TestClient(create_app()) as test_client:
+        assert test_client.get("/status").json()["suppression"]["enabled"] is False

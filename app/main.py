@@ -14,11 +14,16 @@ GET /playout
 
 GET /status, POST /reset
     Diagnostics and a full state reset.
+
+The return service starts with automatic howling suppression disabled.  Set
+``MONITOR_AUTO_SUPPRESSION=true`` (or pass ``auto_suppression=True`` to
+``create_app``) to engage it; see ``app/suppression.py`` for the algorithm.
 """
 
 from __future__ import annotations
 
 import base64
+import os
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -38,8 +43,28 @@ from .constants import (
     SAMPLE_RATE,
 )
 from .engine import BacklogFullError, PlayoutEngine
+from .suppression import (
+    BAND_FREQS_HZ,
+    BAND_HIGH_HZ,
+    BAND_LOW_HZ,
+    BIN_HZ,
+    DOMINANCE_RATIO,
+    NOTCH_Q,
+    NOTCH_RAMP_MS,
+    NOTCH_RAMP_SAMPLES,
+    RELEASE_FRAMES,
+    TRIGGER_FRAMES,
+)
 
 _PCM = "application/octet-stream"
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in _TRUE_VALUES
 
 
 async def _read_frame_body(request: Request) -> bytes:
@@ -86,6 +111,35 @@ def _format_config() -> dict:
         "conceal_gain": CONCEAL_GAIN,
         "recovery_fade_ms": 5,
         "recovery_fade_samples": FADE_SAMPLES,
+        "auto_suppression": {
+            "band_hz": [BAND_LOW_HZ, BAND_HIGH_HZ],
+            "bin_hz": BIN_HZ,
+            "band_bins_hz": [int(freq) for freq in BAND_FREQS_HZ],
+            "dominance_ratio": DOMINANCE_RATIO,
+            "trigger_frames": TRIGGER_FRAMES,
+            "release_frames": RELEASE_FRAMES,
+            "notch_q": NOTCH_Q,
+            "notch_ramp_ms": NOTCH_RAMP_MS,
+            "notch_ramp_samples": NOTCH_RAMP_SAMPLES,
+            "simultaneous_notches": 1,
+        },
+    }
+
+
+def _suppression_headers(info) -> dict[str, str]:
+    return {
+        "X-Notch-Enabled": "true" if info.enabled else "false",
+        "X-Notch-Hz": "" if info.applied_hz is None else str(info.applied_hz),
+        "X-Notch-Ramp": info.ramp or "",
+        "X-Detector-Hz": "" if info.dominant_hz is None else str(info.dominant_hz),
+        "X-Detector-Ratio": (
+            "" if info.dominant_ratio is None else f"{info.dominant_ratio:.6f}"
+        ),
+        "X-Notch-Candidate-Hz": (
+            "" if info.candidate_hz is None else str(info.candidate_hz)
+        ),
+        "X-Notch-Candidate-Frames": str(info.candidate_frames),
+        "X-Notch-Release-Frames": str(info.release_frames),
     }
 
 
@@ -103,6 +157,7 @@ def _playout_headers(result) -> dict[str, str]:
         "X-Conceal-Reason": result.conceal_reason or "",
         "X-Crossfade-Samples": str(result.crossfade_samples),
         "X-History-Samples": str(result.history_samples),
+        **_suppression_headers(result.suppression),
     }
 
 
@@ -121,14 +176,27 @@ def _playout_json(result) -> dict:
         "crossfade_samples": result.crossfade_samples,
         "history_samples": result.history_samples,
         "next_seq": result.next_seq,
+        "suppression": {
+            "enabled": result.suppression.enabled,
+            "notch_hz": result.suppression.applied_hz,
+            "ramp": result.suppression.ramp,
+            "candidate_hz": result.suppression.candidate_hz,
+            "candidate_frames": result.suppression.candidate_frames,
+            "release_frames": result.suppression.release_frames,
+            "detector_hz": result.suppression.dominant_hz,
+            "detector_ratio": result.suppression.dominant_ratio,
+        },
     }
     return payload
 
 
-def create_app() -> FastAPI:
+def create_app(auto_suppression: bool | None = None) -> FastAPI:
+    if auto_suppression is None:
+        auto_suppression = _env_flag("MONITOR_AUTO_SUPPRESSION", False)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.engine = PlayoutEngine()
+        app.state.engine = PlayoutEngine(auto_suppression=auto_suppression)
         yield
 
     app = FastAPI(
@@ -193,6 +261,7 @@ def create_app() -> FastAPI:
             "history_samples": state["history_samples"],
             "had_gap": state["had_gap"],
             "stats": state["stats"],
+            "suppression": state["suppression"],
             "config": _format_config(),
         }
         if include_history:

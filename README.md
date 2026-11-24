@@ -26,16 +26,20 @@ actually played, so the engineer keeps hearing the dialogue instead of muting.
 | --- | --- | --- |
 | `POST` | `/frames?seq=N` | Raw 640-byte PCM16 frame. `202` with `accepted`, `duplicate` or `late_ignored`. Wrong size `400`, oversized `413`, backlog full `429`. |
 | `GET`/`POST` | `/playout` | Pull exactly one frame. Binary body (640 bytes) plus `X-*` metadata headers. `?format=json` returns base64 samples and metadata. |
-| `GET` | `/status` | Cursor, pending sequence numbers, counters, optional played history (`?include_history=true`). |
-| `POST` | `/reset` | Clear all state (used by the demo). |
-| `GET` | `/config` | The format/concealment parameters above. |
+| `GET` | `/status` | Cursor, pending sequence numbers, counters, suppressor state, optional played history (`?include_history=true`). |
+| `POST` | `/reset` | Clear all state, including detector and notch filter state (used by the demo). |
+| `GET` | `/config` | The format/concealment/suppression parameters above. |
 | `GET` | `/healthz` | Liveness for Docker. |
 
 Playout metadata headers: `X-Sequence`, `X-Next-Sequence`, `X-Frame-Kind`
 (`true` / `recovered` / `concealed` / `silence`), `X-Period-Samples`,
 `X-Peak-Correlation`, `X-Conceal-Reason` (`periodic` / `insufficient_history` /
 `autocorr_undefined` / `low_correlation`), `X-Crossfade-Samples`,
-`X-History-Samples`.
+`X-History-Samples`, and for suppression `X-Notch-Enabled`, `X-Notch-Hz`
+(the notch used on this frame, empty when none), `X-Notch-Ramp`
+(`in` / `out` / empty), `X-Detector-Hz`, `X-Detector-Ratio`,
+`X-Notch-Candidate-Hz`, `X-Notch-Candidate-Frames`,
+`X-Notch-Release-Frames`.
 
 ## Semantics
 
@@ -68,12 +72,55 @@ Playout metadata headers: `X-Sequence`, `X-Next-Sequence`, `X-Frame-Kind`
   future frames get `429`; nothing accepted is evicted and the cursor does not
   move.
 
+## Automatic howling suppression
+
+Off by default; the engineer enables it when starting the return service
+(`MONITOR_AUTO_SUPPRESSION=true`). When enabled, every frame that is played is
+also passed through one adaptive notch filter.
+
+* **Detection.** The spectrum of each *original* real frame (the frame as
+  received, before concealment, recovery fade or notching) is inspected on the
+  50 Hz grid between 500 and 4 000 Hz. A bin qualifies on a frame when it is
+  the strongest in that band and holds at least 70 % of the band's total
+  energy. A frame with zero in-band energy never qualifies.
+* **Trigger.** The same bin qualifying on three consecutive real frames
+  engages the notch from the third frame onward; that third frame carries the
+  5 ms fade-in, so it starts dry and ends fully notched. Only one frequency is
+  suppressed at a time.
+* **Release.** The active bin must keep qualifying; three consecutive real
+  frames without it release the notch from the third frame onward. That third
+  frame carries the 5 ms fade-out, so it starts notched and reaches the dry
+  signal at the 5 ms point; later frames are unfiltered.
+* **Missing frames.** A missing (concealed or silent) slot breaks both
+  counters but leaves the current notch running.
+* **Filtering.** An RBJ notch biquad (Q = 20) is applied to the audio that
+  actually plays - true frames, the recovery fade-in and concealment alike.
+  Engage and release each crossfade over 5 ms; while engaged, the filter state
+  carries over between frames. The notched samples become the played history,
+  so later concealment is derived from them too.
+* **Steady state.** The suppressed bin is attenuated by well over 20 dB
+  (measured > 70 dB for a full-scale tone); every frequency at least 200 Hz
+  away stays within ±1 dB of unity.
+* **Bounded cost.** Detector and filter state are fixed-size; nothing grows
+  with the length of the live stream. Pulls do not wait for future packets —
+  the detector only ever looks at the frame being played.
+* **Reset.** `POST /reset` clears the streak counters, the notch and the
+  filter history.
+
+`GET /config` publishes the parameters under `auto_suppression`; `GET /status`
+shows `suppression` (enabled, active notch, streak counters, counters) and the
+playout headers include `X-Notch-*` / `X-Detector-*` per frame.
+
 ## Run with Docker Compose
 
 ```bash
 docker compose up --build
 # in another shell
 python3 scripts/demo.py --url http://127.0.0.1:8000 --out demo_out
+
+# with automatic howling suppression enabled on the return service
+MONITOR_AUTO_SUPPRESSION=true docker compose up --build
+python3 scripts/demo.py --url http://127.0.0.1:8000 --out demo_out --suppression
 
 # or run the same demo as a one-shot compose service
 docker compose --profile demo run --rm demo
@@ -87,7 +134,13 @@ frame kinds, the untouched samples after each 5 ms fade and the halving between
 consecutive concealments. It writes `demo_out/playout.wav` (listenable) and
 `demo_out/transcript.json`, and exits non-zero if a check fails.
 
-Raw curl equivalent of the key cases:
+`--suppression` additionally resets the service and exercises the suppressor:
+three 1 000 Hz frames engage the notch on the third frame, a missing frame
+keeps the notch while breaking the count, and three 2 000 Hz frames release it
+on the third. The service must have been started with
+`MONITOR_AUTO_SUPPRESSION=true`.
+
+Raw curl equivalents of the key cases:
 
 ```bash
 # frame N is the 640-byte body; generate with scripts/demo.py's make_frames
@@ -105,13 +158,40 @@ curl -sS -X POST --data-binary @f002.bin -H 'Content-Type: application/octet-str
   'http://127.0.0.1:8000/frames?seq=2'        # late_ignored
 ```
 
+Suppression over curl (service started with `MONITOR_AUTO_SUPPRESSION=true`;
+`h000.bin`.. are 640-byte 1 000 Hz frames, `r000.bin`.. are 2 000 Hz):
+
+```bash
+# trigger: the third consecutive 1000 Hz frame engages the notch
+for n in 000 001 002; do
+  curl -sS -X POST --data-binary @h$n.bin \
+    -H 'Content-Type: application/octet-stream' \
+    "http://127.0.0.1:8000/frames?seq=$((10#$n))"
+done
+curl -sS -D - -o /dev/null 'http://127.0.0.1:8000/playout'   # X-Notch-Hz: (empty)
+curl -sS -D - -o /dev/null 'http://127.0.0.1:8000/playout'   # X-Notch-Hz: (empty)
+curl -sS -D - -o /dev/null 'http://127.0.0.1:8000/playout'   # X-Notch-Hz: 1000, X-Notch-Ramp: in
+curl -sS -D - -o /dev/null 'http://127.0.0.1:8000/playout'   # seq 3 missing -> concealed, X-Notch-Hz: 1000
+# release: three consecutive 2000 Hz frames, notch out on the third
+for n in 000 001 002; do
+  curl -sS -X POST --data-binary @r$n.bin \
+    -H 'Content-Type: application/octet-stream' \
+    "http://127.0.0.1:8000/frames?seq=$((4 + 10#$n))"
+done
+for _ in 1 2 3 4; do
+  curl -sS -D - -o /dev/null 'http://127.0.0.1:8000/playout'
+done   # notches 1000, 1000, 1000 (out on the 3rd), then empty
+curl -sS 'http://127.0.0.1:8000/status'   # suppression.notch_hz is null
+```
+
 ## Local development
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 41 tests
+pytest                                   # 86 tests
 uvicorn app.main:app --port 8000         # then run scripts/demo.py
+MONITOR_AUTO_SUPPRESSION=true uvicorn app.main:app --port 8000
 ```
 
 Playback state lives in process memory, so run **one** uvicorn worker (the
@@ -119,5 +199,7 @@ Docker image does). Running several workers or replicas would give each its own
 cursor; that needs sticky routing or an external shared state store.
 
 Layout: `app/concealment.py` (NumPy period search, concealment, fade),
+`app/suppression.py` (band detector, notch biquad, 5 ms ramps),
 `app/engine.py` (ordered playout state machine), `app/main.py` (FastAPI),
-`scripts/demo.py` (lossy/reordered demo + self-check), `tests/`.
+`scripts/demo.py` (lossy/reordered demo + suppression scenario + self-check),
+`tests/`.

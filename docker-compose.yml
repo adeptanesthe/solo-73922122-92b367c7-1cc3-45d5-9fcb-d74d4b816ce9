@@ -6,6 +6,11 @@ services:
       - "8000:8000"
     environment:
       PYTHONUNBUFFERED: "1"
+      # Automatic howling suppression is off by default; the engineer enables
+      # it when they start the return service:
+      #   MONITOR_AUTO_SUPPRESSION=true docker compose up --build
+      # or set it to "true" here.
+      MONITOR_AUTO_SUPPRESSION: "${MONITOR_AUTO_SUPPRESSION:-false}"
     restart: unless-stopped
     healthcheck:
       test:
@@ -20,6 +25,9 @@ services:
 
   # One-shot lossy/reordered API demo:
   #   docker compose --profile demo run --rm demo
+  # With auto suppression enabled on the service, add --suppression:
+  #   docker compose --profile demo run --rm demo --suppression
+  # (or append the flag after `scripts/demo.py`).
   demo:
     image: monitor-return:latest
     profiles: ["demo"]

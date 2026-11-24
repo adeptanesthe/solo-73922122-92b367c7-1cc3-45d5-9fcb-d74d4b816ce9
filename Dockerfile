@@ -2,7 +2,11 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    MONITOR_AUTO_SUPPRESSION=false
+
+# Set MONITOR_AUTO_SUPPRESSION=true (e.g. in docker-compose.yml) to start the
+# service with automatic howling suppression engaged.
 
 WORKDIR /srv
 COPY requirements.txt .
